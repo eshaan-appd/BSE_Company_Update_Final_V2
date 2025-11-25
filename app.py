@@ -24,7 +24,8 @@ st.set_page_config(
 # OpenAI client init & diagnostics
 # =========================================
 
-api_key = st.secrets.get("OPENAI_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+# 🔧 use the normal secret name; change if your secrets key is different
+api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not api_key:
     st.error("Missing OPENAI_API_KEY (set env var or add to Streamlit secrets).")
     st.stop()
@@ -276,11 +277,8 @@ def _upload_to_openai(pdf_bytes: bytes, fname: str = "document.pdf"):
         f = client.files.create(file=open(tmp.name, "rb"), purpose="assistants")
     return f
 
-def _render_bordered_table_from_json(json_text: str, key: str = "table"):
-    """
-    Safely render a bordered table from JSON-like text.
-    Auto-cleans extra backticks, markdown fences, and stray text.
-    """
+def _parse_table_from_json(json_text: str, key: str = "table") -> pd.DataFrame | None:
+    """Parse the JSON text into a DataFrame without rendering."""
     import json
 
     cleaned = (
@@ -298,37 +296,47 @@ def _render_bordered_table_from_json(json_text: str, key: str = "table"):
 
     try:
         data = json.loads(cleaned)
-        rows = data.get(key, [])
-        if not rows:
-            st.warning("No rows found in parsed JSON.")
-            st.code(cleaned, language="json")
-            return
-        df = pd.DataFrame(rows)
-        styled = (
-            df.style.hide(axis="index").set_table_styles(
-                [
-                    {
-                        "selector": "table",
-                        "props": "border-collapse: collapse; border: 1px solid #bbb;",
-                    },
-                    {
-                        "selector": "th",
-                        "props": (
-                            "border: 1px solid #bbb; padding: 8px; "
-                            "background: #f6f7fb; text-align: left;"
-                        ),
-                    },
-                    {
-                        "selector": "td",
-                        "props": "border: 1px solid #bbb; padding: 8px;",
-                    },
-                ]
-            )
-        )
-        st.markdown(styled.to_html(), unsafe_allow_html=True)
-    except Exception as e:
-        st.warning(f"Could not parse model output as JSON ({e}). Showing raw text:")
+    except Exception:
+        return None
+
+    rows = data.get(key, [])
+    if not rows:
+        return None
+    return pd.DataFrame(rows)
+
+def _render_bordered_table_from_json(json_text: str, key: str = "table"):
+    """
+    Safely render a bordered table from JSON-like text.
+    Auto-cleans extra backticks, markdown fences, and stray text.
+    """
+    df = _parse_table_from_json(json_text, key=key)
+    if df is None or df.empty:
+        st.warning("No rows found in parsed JSON.")
         st.code(json_text)
+        return
+
+    styled = (
+        df.style.hide(axis="index").set_table_styles(
+            [
+                {
+                    "selector": "table",
+                    "props": "border-collapse: collapse; border: 1px solid #bbb;",
+                },
+                {
+                    "selector": "th",
+                    "props": (
+                        "border: 1px solid #bbb; padding: 8px; "
+                        "background: #f6f7fb; text-align: left;"
+                    ),
+                },
+                {
+                    "selector": "td",
+                    "props": "border: 1px solid #bbb; padding: 8px;",
+                },
+            ]
+        )
+    )
+    st.markdown(styled.to_html(), unsafe_allow_html=True)
 
 def summarize_pdf_with_openai(
     pdf_bytes: bytes,
@@ -433,7 +441,13 @@ Column definitions and guidance:
   • Comment on potential valuation implication:
     EPS impact, leverage, ROE, growth visibility, multiple re-rating, overhangs.
   • If quantitative details are available (deal value, EV, P/E, etc.), briefly refer to them.
-  • If no meaningful comment is possible even after optionally using web_search, say "Not enough information".
+  • Even if explicit numbers are not provided, use your own expert judgement based on:
+    – the nature and size of the event (acquisition, merger, slump sale, QIP, etc.),
+    – its impact on leverage, equity dilution, goodwill/intangibles and balance sheet strength,
+    – expected changes to revenue growth, margins, business mix and risk profile,
+    and provide a directional, qualitative assessment (e.g. "near-term EPS dilutive due to equity issuance but ROE accretive over 2–3 years if synergies are realised").
+  • Where helpful, you may also use web_search to understand the company’s current scale and sector context, but do not invent precise targets or numerical forecasts that are not supported.
+  • Only if you genuinely cannot infer any economic impact (for example, a purely procedural or non-material filing), say "Not enough information".
 
 - "Expected Triggers Ahead":
   • List 2–5 key upcoming milestones or triggers investors should track
@@ -603,6 +617,8 @@ if run:
     st.subheader("📑 Summaries (OpenAI)")
     nm, subcol = _pick_company_cols(df_hits)
 
+    all_tables = []  # 👈 collect all row tables here for Excel
+
     # Worker to download and summarize a single row
     def worker(idx, row, urls):
         # try urls in order until one downloads
@@ -617,7 +633,7 @@ if run:
                 continue
 
         if not pdf_bytes:
-            return idx, used_url, "⚠️ Could not fetch a valid PDF.", None
+            return idx, used_url, "⚠️ Could not fetch a valid PDF."
 
         company = str(row.get(nm) or "").strip()
         headline = str(row.get("HEADLINE") or "").strip()
@@ -640,7 +656,7 @@ if run:
             max_output_tokens=int(max_tokens),
             temperature=float(temperature),
         )
-        return idx, used_url, summary, None
+        return idx, used_url, summary
 
     # Run with limited parallelism
     with ThreadPoolExecutor(max_workers=max_workers) as ex:
@@ -649,7 +665,7 @@ if run:
             for i, (r, urls) in enumerate(rows)
         ]
         for fut in as_completed(futs):
-            i, pdf_url, summary, _ = fut.result()
+            i, pdf_url, summary = fut.result()
             r = rows[i][0]
             company = str(r.get(nm) or "").strip()
             dt = str(r.get("NEWS_DT") or "").strip()
@@ -659,13 +675,36 @@ if run:
             # Optional context header per summary (uncomment if you like):
             # st.markdown(f"### {company}")
             # st.caption(f"{dt} · {headline} · {subcat}")
+
+            # Render table for this summary
             _render_bordered_table_from_json(summary, key="table")
+
+            # Also collect for Excel download
+            df_one = _parse_table_from_json(summary, key="table")
+            if df_one is not None and not df_one.empty:
+                all_tables.append(df_one)
+
+    # 👉 After all summaries, offer a combined Excel download
+    if all_tables:
+        combined_df = pd.concat(all_tables, ignore_index=True)
+        buffer = io.BytesIO()
+        with pd.ExcelWriter(buffer, engine="xlsxwriter") as writer:
+            combined_df.to_excel(writer, index=False, sheet_name="Summaries")
+        buffer.seek(0)
+
+        st.download_button(
+            label="💾 Download all summaries as Excel",
+            data=buffer,
+            file_name=f"bse_summaries_{start_str}_{end_str}.xlsx",
+            mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
+        )
 
 else:
     st.info(
         "Pick your date range and click **Fetch & Summarize with OpenAI**. "
         "This version uploads each PDF to OpenAI, lets the model web-search "
         "for latest market cap and missing details, and renders the model’s "
-        "structured summary (with event nature, timeline, valuation impact, "
-        "triggers, risks, probability, and source docs) right here."
+        "structured summary (with event nature, valuation impact based on "
+        "its own judgement, triggers, risks, probability, and source docs) "
+        "right here. You can then download all rows as an Excel file."
     )
