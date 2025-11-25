@@ -24,7 +24,7 @@ st.set_page_config(
 # OpenAI client init & diagnostics
 # =========================================
 
-api_key = st.secrets.get("OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
+api_key = st.secrets.get("OPENAI_OPENAI_API_KEY", os.getenv("OPENAI_API_KEY"))
 if not api_key:
     st.error("Missing OPENAI_API_KEY (set env var or add to Streamlit secrets).")
     st.stop()
@@ -346,6 +346,7 @@ def summarize_pdf_with_openai(
     """
     Uses the Responses API with a file attachment.
     The model reads the PDF and returns a structured JSON object with detailed deal analytics.
+    Now also uses web_search to fetch Market Cap and fill missing key data where needed.
     """
     fobj = _upload_to_openai(pdf_bytes, fname=f"{_slug(company or 'doc')}.pdf")
 
@@ -355,9 +356,23 @@ def summarize_pdf_with_openai(
         else "Use compact sentence-style phrasing inside the JSON fields."
     )
 
-    # JSON braces in f-string are fine since we're not nesting {} for formatting inside
     task = f"""
 You are a meticulous M&A / corporate actions analyst specializing in Indian listed company filings.
+
+You have access to a web_search tool. Use it when:
+- You need the latest market capitalisation of the company and it is not clearly present in the PDF.
+- You need to supplement missing basic deal details (e.g., deal size, counterparty, listing ticker) that are not clearly available in the PDF.
+Always treat the PDF as the primary / authoritative source. Use web_search only to:
+- Fill gaps when the PDF is ambiguous or silent; and
+- Cross-check obvious facts, without contradicting explicit statements in the PDF.
+
+Web search guidance:
+- For market cap, search something like:
+  "Market cap {company} screener.in" OR "Market capitalization {company} BSE" OR "Market capitalization {company} NSE"
+- Prefer reliable sites (stock exchanges, Screener, Moneycontrol, company filings, etc.).
+- Use the latest available market cap for the main Indian listed entity.
+- Express the final Market Cap in INR crore (₹ Cr). If the source is in INR but not in crore, convert appropriately (1 Cr = 10,000,000).
+- If web_search fails repeatedly or you cannot get a reliable market cap, return exactly "NA" for Market Cap.
 
 Read the attached BSE/SEBI filing PDF carefully and produce a table with exactly one row and the following columns:
 
@@ -379,10 +394,14 @@ Column definitions and guidance:
 
 - "Company":
   • Copy the company name from the provided context below (do not invent a new name).
+  • If you believe the legal name in the PDF slightly differs from the context (e.g., abbreviations), align with the PDF version.
 
 - "Market Cap (₹ Cr)":
-  • If the market cap is explicitly mentioned in the filing or you can clearly infer it, put that value (numeric or short string).
-  • Otherwise, return exactly "{market_cap}" (the default context value).
+  • First, check if the market cap is explicitly mentioned in the PDF.
+  • If not clearly available, you MUST call web_search to fetch the latest reliable market cap for the listed company.
+  • Convert the figure to INR Crore (₹ Cr) if needed.
+  • Return a concise numeric value or short string (e.g., "4,500").
+  • If, after attempting web_search, you still cannot confidently determine the market cap, return exactly "NA".
 
 - "Nature of Event":
   • High-level classification such as:
@@ -399,6 +418,7 @@ Column definitions and guidance:
 - "Key Announcement Components":
   • 2–5 short bullet-style points capturing the core economic/strategic elements:
     counterparty, size, structure, consideration, key conditions, regulatory aspects.
+  • If the PDF is vague on deal size or structure and you cannot determine it even via web_search, explicitly say "Deal size not clearly disclosed".
 
 - "Timeline (announcement → approvals → execution)":
   • Narrative or bullet-style sequence from:
@@ -413,7 +433,7 @@ Column definitions and guidance:
   • Comment on potential valuation implication:
     EPS impact, leverage, ROE, growth visibility, multiple re-rating, overhangs.
   • If quantitative details are available (deal value, EV, P/E, etc.), briefly refer to them.
-  • If no meaningful comment is possible, say "Not enough information".
+  • If no meaningful comment is possible even after optionally using web_search, say "Not enough information".
 
 - "Expected Triggers Ahead":
   • List 2–5 key upcoming milestones or triggers investors should track
@@ -446,7 +466,7 @@ Output format — return ONLY valid JSON with this exact structure (no prose, no
   "table": [
     {{
       "Company": "{company or 'NA'}",
-      "Market Cap (₹ Cr)": "{market_cap}",
+      "Market Cap (₹ Cr)": "<final market cap in ₹ Cr or 'NA'>",
       "Nature of Event": "<nature>",
       "Announcement Type From PDF": "<announcement type>",
       "Key Announcement Components": "<key components>",
@@ -468,12 +488,15 @@ Headline: {headline or 'NA'}
 Subcategory: {subcat or 'NA'}
 PDF URL: {pdf_url or 'NA'}
 BSE Announcement URL: {news_url or 'NA'}
+Current Market Cap Placeholder (may be 'NA'): {market_cap}
 """
 
     resp = client.responses.create(
         model=model,
         temperature=temperature,
         max_output_tokens=max_output_tokens,
+        # enable web search tool
+        tools=[{"type": "web_search"}],
         input=[{
             "role": "user",
             "content": [
@@ -482,7 +505,7 @@ BSE Announcement URL: {news_url or 'NA'}
             ],
         }],
     )
-    return (resp.output_text or "").strip()
+    return (getattr(resp, "output_text", None) or "").strip()
 
 def safe_summarize(*args, **kwargs) -> str:
     """Simple rate-limit-friendly wrapper around summarize_pdf_with_openai."""
@@ -601,7 +624,7 @@ if run:
         subcat = str(row.get(subcol) or "").strip()
         news_url = _primary_bse_url(row)
 
-        # Placeholder for now; plug in real market-cap fetch if desired
+        # Placeholder for now; model will override using web_search where possible
         market_cap = "NA"
 
         summary = safe_summarize(
@@ -641,7 +664,8 @@ if run:
 else:
     st.info(
         "Pick your date range and click **Fetch & Summarize with OpenAI**. "
-        "This version uploads each PDF to OpenAI and renders the model’s "
+        "This version uploads each PDF to OpenAI, lets the model web-search "
+        "for latest market cap and missing details, and renders the model’s "
         "structured summary (with event nature, timeline, valuation impact, "
         "triggers, risks, probability, and source docs) right here."
     )
