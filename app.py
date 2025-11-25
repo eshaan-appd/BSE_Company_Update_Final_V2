@@ -367,4 +367,281 @@ Read the attached BSE/SEBI filing PDF carefully and produce a table with exactly
 4) Announcement Type From PDF
 5) Key Announcement Components
 6) Timeline (announcement → approvals → execution)
-7) Stakehold
+7) Stakeholder Impact
+8) Valuation Impact
+9) Expected Triggers Ahead
+10) Risks
+11) Probability Assessment
+12) Regulations
+13) Source Documents
+
+Column definitions and guidance:
+
+- "Company":
+  • Copy the company name from the provided context below (do not invent a new name).
+
+- "Market Cap (₹ Cr)":
+  • If the market cap is explicitly mentioned in the filing or you can clearly infer it, put that value (numeric or short string).
+  • Otherwise, return exactly "{market_cap}" (the default context value).
+
+- "Nature of Event":
+  • High-level classification such as:
+    "Acquisition", "Business Transfer", "Amalgamation / Merger", "Demerger",
+    "Joint Venture", "Slump Sale", "Scheme of Arrangement", "Preferential Issue",
+    "QIP", "Buyback", "ESOP / ESOS", etc.
+
+- "Announcement Type From PDF":
+  • Concise, specific title of the announcement, e.g.:
+    "Outcome of Board Meeting", "Intimation of Board Meeting",
+    "Scheme of Amalgamation", "Approval of Scheme by NCLT",
+    "Execution of Share Purchase Agreement", etc.
+
+- "Key Announcement Components":
+  • 2–5 short bullet-style points capturing the core economic/strategic elements:
+    counterparty, size, structure, consideration, key conditions, regulatory aspects.
+
+- "Timeline (announcement → approvals → execution)":
+  • Narrative or bullet-style sequence from:
+    initial announcement → board/shareholder/regulatory approvals → expected completion.
+  • If future dates are mentioned, include them; otherwise, give an indicative/relative description.
+
+- "Stakeholder Impact":
+  • Briefly assess impact on key stakeholders:
+    shareholders, lenders, employees, customers, regulators, promoters.
+
+- "Valuation Impact":
+  • Comment on potential valuation implication:
+    EPS impact, leverage, ROE, growth visibility, multiple re-rating, overhangs.
+  • If quantitative details are available (deal value, EV, P/E, etc.), briefly refer to them.
+  • If no meaningful comment is possible, say "Not enough information".
+
+- "Expected Triggers Ahead":
+  • List 2–5 key upcoming milestones or triggers investors should track
+    (regulatory approvals, completion timelines, integration progress, further disclosures, etc.).
+
+- "Risks":
+  • 2–5 concise risk points (regulatory, execution, financing, integration, dilution, etc.).
+
+- "Probability Assessment":
+  • Classify overall likelihood of successful completion of the core event as one of:
+    "Low", "Medium", or "High".
+
+- "Regulations":
+  • If the PDF explicitly cites regulations, reproduce them exactly
+    (e.g. "Regulation 30 of SEBI (LODR) Regulations, 2015").
+  • Otherwise, infer likely applicable regulations (e.g. Reg. 30, Reg. 33, SEBI (PIT), SEBI (ICDR)) and list them.
+
+- "Source Documents":
+  • Use exactly the following URLs from context:
+    PDF: {pdf_url or 'NA'}
+    BSE Announcement: {news_url or 'NA'}
+  • Return them in a single string, e.g.:
+    "PDF: {pdf_url or 'NA'}; BSE: {news_url or 'NA'}".
+
+{style_hint}
+
+Output format — return ONLY valid JSON with this exact structure (no prose, no markdown):
+
+{{
+  "table": [
+    {{
+      "Company": "{company or 'NA'}",
+      "Market Cap (₹ Cr)": "{market_cap}",
+      "Nature of Event": "<nature>",
+      "Announcement Type From PDF": "<announcement type>",
+      "Key Announcement Components": "<key components>",
+      "Timeline (announcement → approvals → execution)": "<timeline>",
+      "Stakeholder Impact": "<stakeholder impact>",
+      "Valuation Impact": "<valuation impact>",
+      "Expected Triggers Ahead": "<expected triggers>",
+      "Risks": "<risks>",
+      "Probability Assessment": "<Low|Medium|High>",
+      "Regulations": "<regulation text>",
+      "Source Documents": "PDF: {pdf_url or 'NA'}; BSE: {news_url or 'NA'}"
+    }}
+  ]
+}}
+
+Context:
+Company: {company or 'NA'}
+Headline: {headline or 'NA'}
+Subcategory: {subcat or 'NA'}
+PDF URL: {pdf_url or 'NA'}
+BSE Announcement URL: {news_url or 'NA'}
+"""
+
+    resp = client.responses.create(
+        model=model,
+        temperature=temperature,
+        max_output_tokens=max_output_tokens,
+        input=[{
+            "role": "user",
+            "content": [
+                {"type": "input_text", "text": task},
+                {"type": "input_file", "file_id": fobj.id},
+            ],
+        }],
+    )
+    return (resp.output_text or "").strip()
+
+def safe_summarize(*args, **kwargs) -> str:
+    """Simple rate-limit-friendly wrapper around summarize_pdf_with_openai."""
+    for i in range(4):
+        try:
+            return summarize_pdf_with_openai(*args, **kwargs)
+        except Exception as e:
+            msg = str(e)
+            if "429" in msg or "rate" in msg.lower():
+                time.sleep(2.0 * (i + 1))
+                continue
+            raise
+    return "⚠️ Unable to summarize due to repeated rate limits."
+
+# =========================================
+# Sidebar controls
+# =========================================
+with st.sidebar:
+    st.header("⚙️ Controls")
+    today = datetime.now().date()
+    start_date = st.date_input(
+        "Start date",
+        value=today - timedelta(days=1),
+        max_value=today
+    )
+    end_date = st.date_input(
+        "End date",
+        value=today,
+        max_value=today,
+        min_value=start_date
+    )
+
+    model = st.selectbox(
+        "OpenAI model",
+        ["gpt-4.1-mini", "gpt-4o-mini", "gpt-4.1"],
+        index=0,
+        help="Models with vision/file-reading capability. 4.1-mini/4o-mini are cost-efficient."
+    )
+    style = st.radio("Summary style", ["bullets", "narrative"], horizontal=True)
+    max_tokens = st.slider("Max output tokens", 200, 2000, 800, step=50)
+    temperature = st.slider("Creativity (temperature)", 0.0, 1.0, 0.2, step=0.1)
+
+    max_workers = st.slider(
+        "Parallel summaries", 1, 8, 3,
+        help="Lower if you hit 429s."
+    )
+    max_items = st.slider(
+        "Max announcements to summarize", 5, 200, 60, step=5
+    )
+
+    run = st.button("🚀 Fetch & Summarize with OpenAI", type="primary")
+
+# =========================================
+# Run pipeline (fetch → PDFs → OpenAI summaries)
+# =========================================
+def _fmt(d: datetime.date) -> str:
+    return d.strftime("%Y%m%d")
+
+def _pick_company_cols(df: pd.DataFrame) -> tuple[str, str]:
+    nm = _first_col(df, ["SLONGNAME", "SNAME", "SC_NAME", "COMPANYNAME"]) or "SLONGNAME"
+    subcol = _first_col(
+        df,
+        ["SUBCATEGORYNAME", "SUBCATEGORY", "SUB_CATEGORY", "NEWS_SUBCATEGORY"]
+    ) or "SUBCATEGORYNAME"
+    return nm, subcol
+
+if run:
+    if not os.getenv("OPENAI_API_KEY") and "OPENAI_API_KEY" not in st.secrets:
+        st.error(
+            "Missing OPENAI_API_KEY (set env var, add to Streamlit Secrets, or export in your shell)."
+        )
+        st.stop()
+
+    start_str, end_str = _fmt(start_date), _fmt(end_date)
+
+    with st.status("Fetching announcements…", expanded=True):
+        df_hits = fetch_bse_announcements_strict(
+            start_str, end_str, verbose=False
+        )
+        st.write(f"Matched rows after filters: **{len(df_hits)}**")
+
+    if df_hits.empty:
+        st.warning("No matching announcements in this window.")
+        st.stop()
+
+    if len(df_hits) > max_items:
+        df_hits = df_hits.head(max_items)
+
+    # Build list of PDF targets
+    rows = []
+    for _, r in df_hits.iterrows():
+        urls = _candidate_urls(r)
+        rows.append((r, urls))
+
+    st.subheader("📑 Summaries (OpenAI)")
+    nm, subcol = _pick_company_cols(df_hits)
+
+    # Worker to download and summarize a single row
+    def worker(idx, row, urls):
+        # try urls in order until one downloads
+        pdf_bytes, used_url = None, ""
+        for u in urls:
+            try:
+                data = _download_pdf(u, timeout=25)
+                if data and len(data) > 500:
+                    pdf_bytes, used_url = data, u
+                    break
+            except Exception:
+                continue
+
+        if not pdf_bytes:
+            return idx, used_url, "⚠️ Could not fetch a valid PDF.", None
+
+        company = str(row.get(nm) or "").strip()
+        headline = str(row.get("HEADLINE") or "").strip()
+        subcat = str(row.get(subcol) or "").strip()
+        news_url = _primary_bse_url(row)
+
+        # Placeholder for now; plug in real market-cap fetch if desired
+        market_cap = "NA"
+
+        summary = safe_summarize(
+            pdf_bytes,
+            company,
+            headline,
+            subcat,
+            used_url,          # pdf_url
+            news_url,          # exchange URL
+            market_cap=market_cap,
+            model=model,
+            style=("bullets" if style == "bullets" else "narrative"),
+            max_output_tokens=int(max_tokens),
+            temperature=float(temperature),
+        )
+        return idx, used_url, summary, None
+
+    # Run with limited parallelism
+    with ThreadPoolExecutor(max_workers=max_workers) as ex:
+        futs = [
+            ex.submit(worker, i, r, urls)
+            for i, (r, urls) in enumerate(rows)
+        ]
+        for fut in as_completed(futs):
+            i, pdf_url, summary, _ = fut.result()
+            r = rows[i][0]
+            company = str(r.get(nm) or "").strip()
+            dt = str(r.get("NEWS_DT") or "").strip()
+            subcat = str(r.get(subcol) or "").strip()
+            headline = str(r.get("HEADLINE") or "").strip()
+
+            # Optional context header per summary (uncomment if you like):
+            # st.markdown(f"### {company}")
+            # st.caption(f"{dt} · {headline} · {subcat}")
+            _render_bordered_table_from_json(summary, key="table")
+
+else:
+    st.info(
+        "Pick your date range and click **Fetch & Summarize with OpenAI**. "
+        "This version uploads each PDF to OpenAI and renders the model’s "
+        "structured summary (with event nature, timeline, valuation impact, "
+        "triggers, risks, probability, and source docs) right here."
+    )
